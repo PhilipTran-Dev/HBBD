@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { motion, useAnimationControls } from 'framer-motion'
 import { Clock, Loader2, Send } from 'lucide-react'
 import Toast from './Toast'
@@ -6,6 +6,7 @@ import WishModal from './WishModal'
 import WishesBoard from './WishesBoard'
 import { fetchSubmissionStatus, fetchWishes, saveWish } from '../lib/db'
 import { fireSubmissionBurst } from '../lib/confetti'
+import { isMobileViewport } from '../lib/dom'
 
 const TOAST_DURATION = 3200
 const LOCK_MS = 30 * 60 * 1000
@@ -36,6 +37,8 @@ export default function BirthdayCelebration({ photoSrc }) {
 
   const formShake = useAnimationControls()
   const toastTimer = useRef(null)
+  // Screens are either mobile or desktop for a session; resolve once.
+  const mobile = useMemo(() => isMobileViewport(), [])
 
   const showToast = useCallback(
     (variant, title, text, duration = TOAST_DURATION) => {
@@ -257,30 +260,45 @@ export default function BirthdayCelebration({ photoSrc }) {
       className="relative z-30 min-h-[100dvh] w-full bg-gradient-to-b from-sky-200 via-sky-50 to-amber-50 px-4 py-8"
     >
       <div className="pointer-events-none absolute inset-0 overflow-hidden">
-        <div className="absolute -left-20 top-10 h-64 w-64 rounded-full bg-amber-200/50 blur-3xl" />
-        <div className="absolute -right-16 bottom-24 h-72 w-72 rounded-full bg-sky-200/50 blur-3xl" />
-        {CELEBRATION_EMOJIS.map((emoji, index) => (
-          <motion.span
-            key={`${emoji}-${index}`}
-            aria-hidden="true"
-            className="absolute select-none text-3xl"
-            style={{ left: `${6 + index * 15}%`, top: '4%' }}
-            animate={{ y: [0, -380], opacity: [0, 1, 0], rotate: [0, 40] }}
-            transition={{
-              duration: 8 + index,
-              delay: index * 1.1,
-              repeat: Infinity,
-              ease: 'easeInOut',
-            }}
-          >
-            {emoji}
-          </motion.span>
-        ))}
+        <div className={`absolute -left-20 top-10 h-64 w-64 rounded-full bg-amber-200/50 ${mobile ? 'blur-xl' : 'blur-2xl'}`} />
+        <div className={`absolute -right-16 bottom-24 h-72 w-72 rounded-full bg-sky-200/50 ${mobile ? 'blur-xl' : 'blur-2xl'}`} />
+        {CELEBRATION_EMOJIS.map((emoji, index) =>
+          mobile ? (
+            // Mobile: keep the decorative emojis STATIC — six infinite
+            // translate/rotate loops on a 60Hz phone are not worth it.
+            <span
+              key={`${emoji}-${index}`}
+              aria-hidden="true"
+              className="absolute select-none text-3xl"
+              style={{ left: `${6 + index * 15}%`, top: '4%', transform: 'translate3d(0, 0, 0)' }}
+            >
+              {emoji}
+            </span>
+          ) : (
+            <motion.span
+              key={`${emoji}-${index}`}
+              aria-hidden="true"
+              className="absolute select-none text-3xl"
+              style={{ left: `${6 + index * 15}%`, top: '4%', willChange: 'transform' }}
+              animate={{ y: [0, -380], opacity: [0, 1, 0], rotate: [0, 40] }}
+              transition={{
+                duration: 8 + index,
+                delay: index * 1.1,
+                repeat: Infinity,
+                ease: 'easeInOut',
+              }}
+            >
+              {emoji}
+            </motion.span>
+          ),
+        )}
       </div>
 
       <div className="relative mx-auto flex w-full max-w-md flex-col gap-6">
         {/* Celebration hero */}
-        <section className="relative overflow-hidden rounded-[2rem] border border-white/70 bg-white/60 px-5 pb-8 pt-7 text-center shadow-xl backdrop-blur">
+        <section className={`relative overflow-hidden rounded-[2rem] border border-white/70 px-5 pb-8 pt-7 text-center shadow-xl ${
+          mobile ? 'bg-white/95' : 'bg-white/60 backdrop-blur'
+        }`}>
 <motion.div
             initial={{ y: -14, opacity: 0, scale: 0.6 }}
             animate={{ y: 0, opacity: 1, scale: 1 }}
@@ -338,7 +356,9 @@ export default function BirthdayCelebration({ photoSrc }) {
           <motion.form
             animate={formShake}
             onSubmit={handleSubmit}
-            className="flex flex-col gap-3 rounded-3xl border border-white/80 bg-white/80 p-5 shadow-lg backdrop-blur-md"
+            className={`flex flex-col gap-3 rounded-3xl border border-white/80 p-5 shadow-lg ${
+              mobile ? 'bg-white/95' : 'bg-white/80 backdrop-blur-md'
+            }`}
           >
             <label className="flex flex-col gap-1.5">
               <span className="text-xs font-bold uppercase tracking-wide text-slate-500">
@@ -371,7 +391,9 @@ export default function BirthdayCelebration({ photoSrc }) {
             </label>
 
             {isLocked ? (
-              <div className="mt-1 inline-flex items-center justify-center gap-2 rounded-2xl border-2 border-amber-200 bg-white/90 px-5 py-3.5 text-sm font-extrabold text-amber-700 shadow-md backdrop-blur">
+              <div className={`mt-1 inline-flex items-center justify-center gap-2 rounded-2xl border-2 border-amber-200 px-5 py-3.5 text-sm font-extrabold text-amber-700 shadow-md ${
+                mobile ? 'bg-white/95' : 'bg-white/90 backdrop-blur'
+              }`}>
                 <Clock className="h-5 w-5 animate-pulse" />
                 <span>
                   Đang tạm khóa: {formatCountdown(lock?.remainingSeconds)} nữa mới

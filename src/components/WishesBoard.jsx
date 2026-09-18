@@ -1,7 +1,12 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { motion } from 'framer-motion'
+import { motion, useAnimationControls } from 'framer-motion'
 import { Loader2, Mail, MailOpen } from 'lucide-react'
-import { buildFrameConstraints, getRefRect } from '../lib/dom'
+import {
+  buildFrameConstraints,
+  getBoundingClientRectSafe,
+  getRefRect,
+  isMobileViewport,
+} from '../lib/dom'
 
 const MAX_ENVELOPES = 12
 
@@ -37,9 +42,15 @@ function buildLayout(wishes) {
   })
 }
 
-function FloatingStatus({ children }) {
+// On mobile the continuous backdrop-blur compositing on a busy canvas is one
+// of the biggest GPU-overdraw culprits, so it degrades to a near-solid panel.
+function FloatingStatus({ children, mobile }) {
   return (
-    <div className="pointer-events-none absolute left-1/2 top-[12%] flex -translate-x-1/2 items-center gap-2 rounded-full bg-white/80 px-4 py-2 text-center shadow backdrop-blur">
+    <div
+      className={`pointer-events-none absolute left-1/2 top-[12%] flex -translate-x-1/2 items-center gap-2 rounded-full px-4 py-2 text-center shadow ${
+        mobile ? 'bg-white/95' : 'bg-white/80 backdrop-blur'
+      }`}
+    >
       {children}
     </div>
   )
@@ -47,6 +58,7 @@ function FloatingStatus({ children }) {
 
 function FloatingEnvelope({
   dragConstraints,
+  mobile,
   wish,
   left,
   top,
@@ -61,6 +73,10 @@ function FloatingEnvelope({
   // release, absorbing the synthetic click browsers emit on touch-up.
   const isDraggingRef = useRef(false)
 
+  // Boundary snapback: if a fling ends up out of the visible safe area, ease
+  // the envelope smoothly back to its slot instead of losing it forever.
+  const snapControls = useAnimationControls()
+
   // Numeric, viewport-relative drag constraints computed from a GUARDED read
   // of the constraint ref. Framer Motion measures ref-based constraints by
   // calling `ref.current.getBoundingClientRect()` internally, which throws
@@ -71,23 +87,45 @@ function FloatingEnvelope({
   // sm:w-24/sm:h-24 = 96px), so width and height always match.
   const [constraints, setConstraints] = useState(null)
   useLayoutEffect(() => {
+    const isSm = typeof window !== 'undefined' && window.matchMedia('(min-width: 640px)').matches
+    const size = isSm ? 96 : 80
+
+    const compute = () => {
+      // Prefer the parent canvas rect; fall back to a viewport-sized safe box
+      // so constraints stay valid even before/after scroll or layout changes.
+      const frame =
+        getRefRect(dragConstraints) ??
+        (() => {
+          const width = typeof window !== 'undefined' ? window.innerWidth : 0
+          const height = typeof window !== 'undefined' ? window.innerHeight : 0
+          return {
+            left: 0,
+            top: 0,
+            width,
+            height: Math.round(height * 0.6),
+            right: width,
+            bottom: Math.round(height * 0.6),
+          }
+        })()
+      return buildFrameConstraints(frame, { left, top, width: size, height: size })
+    }
+
     let alive = true
     const frameId = requestAnimationFrame(() => {
-      if (!alive) return
-      const isSm = typeof window !== 'undefined' && window.matchMedia('(min-width: 640px)').matches
-      const size = isSm ? 96 : 80
-      setConstraints(
-        buildFrameConstraints(getRefRect(dragConstraints), {
-          left,
-          top,
-          width: size,
-          height: size,
-        }),
-      )
+      if (alive) setConstraints(compute())
     })
+
+    // Recompute when the viewport changes so a rotation / resize can never
+    // leave stale boundaries that send envelopes off-screen.
+    const onResize = () => {
+      setConstraints(compute())
+    }
+    window.addEventListener('resize', onResize)
+
     return () => {
       alive = false
       cancelAnimationFrame(frameId)
+      window.removeEventListener('resize', onResize)
     }
   }, [dragConstraints, left, top])
 
@@ -101,24 +139,46 @@ function FloatingEnvelope({
     onOpenWish(wish)
   }
 
+  const handleDragEnd = (event) => {
+    // Keep the flag true momentarily so the trailing click emitted on
+    // touch release is swallowed and cannot open the modal.
+    setTimeout(() => {
+      isDraggingRef.current = false
+    }, 100)
+
+    // Boundary recovery: if the envelope was flung past the visible safe area,
+    // tween it smoothly back to its slot (x/y -> 0 returns to the CSS
+    // left/top position). Momentum on mobile is off, but this also guards the
+    // desktop path where a strong fling can overshoot the elastic.
+    const rect = getBoundingClientRectSafe(event?.currentTarget)
+    if (!rect) return
+    const right =
+      typeof window !== 'undefined' ? window.innerWidth : Math.max(rect.right, rect.left)
+    const bottom =
+      typeof window !== 'undefined' ? window.innerHeight * 0.6 : Math.max(rect.bottom, rect.top)
+    const outOfBounds =
+      rect.left < 0 || rect.top < 0 || rect.right > right || rect.bottom > bottom
+    if (outOfBounds) {
+      snapControls.start({
+        x: 0,
+        y: 0,
+        transition: { type: 'spring', stiffness: 260, damping: 22 },
+      })
+    }
+  }
+
   return (
     <motion.button
       type="button"
       drag
       dragConstraints={constraints ?? undefined}
-      dragElastic={0.25}
-      dragMomentum
+      dragElastic={0.2}
+      dragMomentum={!mobile}
       dragTransition={{ power: 0.4, bounceStiffness: 260, bounceDamping: 20 }}
       onDragStart={() => {
         isDraggingRef.current = true
       }}
-      onDragEnd={() => {
-        // Keep the flag true momentarily so the trailing click emitted on
-        // touch release is swallowed and cannot open the modal.
-        setTimeout(() => {
-          isDraggingRef.current = false
-        }, 100)
-      }}
+      onDragEnd={handleDragEnd}
       onClick={handleClick}
       initial={{ scale: 0, opacity: 0 }}
       animate={{ scale: 1, opacity: 1 }}
@@ -127,7 +187,7 @@ function FloatingEnvelope({
       whileDrag={{ scale: 1.15, zIndex: 40, cursor: 'grabbing' }}
       aria-label={`Mở thư của ${wish.sender_name}`}
       className="pointer-events-auto absolute z-30 flex h-20 w-20 cursor-grab touch-none select-none flex-col items-center justify-center focus:outline-none focus-visible:ring-4 focus-visible:ring-amber-300 active:cursor-grabbing sm:h-24 sm:w-24"
-      style={{ left, top }}
+      style={{ left, top, willChange: 'transform' }}
     >
       <motion.div
         animate={
@@ -146,6 +206,7 @@ function FloatingEnvelope({
           ease: 'easeInOut',
         }}
         className={`relative grid h-14 w-14 place-items-center rounded-2xl border-2 ${palette.border} bg-gradient-to-br ${palette.bg} shadow-lg sm:h-16 sm:w-16`}
+        style={{ willChange: 'transform' }}
       >
         <Mail className="h-7 w-7 text-slate-800 sm:h-8 sm:w-8" />
         <span className="absolute -right-2 -top-2 text-base">💌</span>
@@ -165,6 +226,7 @@ export default function WishesBoard({
   pausedId,
 }) {
   const canvasRef = useRef(null)
+  const mobile = useMemo(() => isMobileViewport(), [])
   const items = useMemo(() => buildLayout(wishes), [wishes])
 
   return (
@@ -173,7 +235,7 @@ export default function WishesBoard({
       className="pointer-events-none fixed inset-x-0 top-[2%] z-30 h-[55vh] overflow-hidden"
     >
       {loading && (
-        <FloatingStatus>
+        <FloatingStatus mobile={mobile}>
           <Loader2 className="h-4 w-4 animate-spin text-amber-500" />
           <p className="text-xs font-semibold text-slate-500">
             Đang mở hộp thư chúc mừng...
@@ -182,7 +244,7 @@ export default function WishesBoard({
       )}
 
       {!loading && error && (
-        <FloatingStatus>
+        <FloatingStatus mobile={mobile}>
           <MailOpen className="h-4 w-4 text-rose-400" />
           <p className="text-xs font-semibold text-slate-500">
             Hộp thư đang bận, chưa mở được rồi 🥲
@@ -191,7 +253,7 @@ export default function WishesBoard({
       )}
 
       {!loading && !error && items.length === 0 && (
-        <FloatingStatus>
+        <FloatingStatus mobile={mobile}>
           <Mail className="h-4 w-4 text-amber-500" />
           <p className="text-xs font-semibold text-slate-500">
             Chưa có lá thư nào. Gửi lời chúc đầu tiên nha!
@@ -205,6 +267,7 @@ export default function WishesBoard({
           <FloatingEnvelope
             key={wish.id}
             dragConstraints={canvasRef}
+            mobile={mobile}
             wish={wish}
             left={left}
             top={top}

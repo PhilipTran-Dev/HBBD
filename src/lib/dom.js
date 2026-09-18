@@ -31,6 +31,15 @@ export function getRefRect(ref) {
 }
 
 /**
+ * True on phones and small tablets (width < 768px). Used to gate the
+ * heaviest visual work (dozens of infinite loops, backdrop-blur layers)
+ * behind a cheap trait, never inside a layout effect.
+ */
+export function isMobileViewport() {
+  return typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches
+}
+
+/**
  * Build viewport-frame drag constraints that framer-motion interprets as
  * offsets relative to the dragged element's own layout box, so the element
  * stays inside `frame`.

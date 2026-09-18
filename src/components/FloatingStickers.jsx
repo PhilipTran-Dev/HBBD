@@ -1,6 +1,6 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
-import { buildFrameConstraints, getRefRect } from '../lib/dom'
+import { buildFrameConstraints, getRefRect, isMobileViewport } from '../lib/dom'
 
 const STICKER_SIZE = 48
 
@@ -41,14 +41,19 @@ const PERIMETER_SLOTS = [
   { left: 86, top: 74 },
 ]
 
+// Mobile keeps only 5 contact points (corners + one side) so the fragment
+// stays far away from 30+ simultaneous infinite transform loops.
+const MOBILE_SLOTS = PERIMETER_SLOTS.slice(0, 5)
+
 function randomBetween(min, max) {
   return min + Math.random() * (max - min)
 }
 
-function createStickers() {
-  const emojis = [...STICKER_POOL, STICKER_POOL[Math.floor(Math.random() * STICKER_POOL.length)]]
+function createStickers({ mobile }) {
+  const slots = mobile ? MOBILE_SLOTS : PERIMETER_SLOTS
+  const emojis = slots.map((_, index) => STICKER_POOL[index % STICKER_POOL.length])
 
-  return PERIMETER_SLOTS.map((slot, index) => {
+  return slots.map((slot, index) => {
     const left = Math.min(96, Math.max(0.5, slot.left + randomBetween(-1, 1)))
     const top = Math.min(88, Math.max(2, slot.top + randomBetween(-1, 1)))
     const isRightHalf = slot.left >= 50
@@ -58,6 +63,9 @@ function createStickers() {
       emoji: emojis[index],
       left: `${left}%`,
       top: `${top}%`,
+      mobile,
+      // Drift values are only consumed by the infinite float loop, which is
+      // disabled on mobile — keep them cheap to compute regardless.
       driftX: (isRightHalf ? 1 : -1) * randomBetween(6, 14),
       driftY: randomBetween(4, 10),
       duration: randomBetween(4, 6.5),
@@ -76,24 +84,35 @@ function FloatingSticker({ sticker, containerRef }) {
   // of the container ref. Framer Motion measures ref-based constraints by
   // calling `ref.current.getBoundingClientRect()` internally, which throws
   // `e.getBoundingClientRect is not a function` when the ref is detached. A
-  // fixed box never touches a live ref, so it cannot crash.
+  // fixed box never touches a live ref, so it cannot crash. Measured once,
+  // recomputed on resize.
   const [constraints, setConstraints] = useState(null)
   useLayoutEffect(() => {
+    const compute = () => {
+      const frame = getRefRect(containerRef)
+      if (!frame) return null
+      return buildFrameConstraints(frame, {
+        left: sticker.left,
+        top: sticker.top,
+        width: STICKER_SIZE,
+        height: STICKER_SIZE,
+      })
+    }
+
     let alive = true
     const frameId = requestAnimationFrame(() => {
-      if (!alive) return
-      setConstraints(
-        buildFrameConstraints(getRefRect(containerRef), {
-          left: sticker.left,
-          top: sticker.top,
-          width: STICKER_SIZE,
-          height: STICKER_SIZE,
-        }),
-      )
+      if (alive) setConstraints(compute())
     })
+
+    const onResize = () => {
+      setConstraints(compute())
+    }
+    window.addEventListener('resize', onResize)
+
     return () => {
       alive = false
       cancelAnimationFrame(frameId)
+      window.removeEventListener('resize', onResize)
     }
   }, [containerRef, sticker.left, sticker.top])
 
@@ -104,12 +123,16 @@ function FloatingSticker({ sticker, containerRef }) {
     }
   }
 
+  const staticEmoji = sticker.mobile
+    ? { style: { transform: 'translate3d(0, 0, 0)', willChange: 'transform' } }
+    : null
+
   return (
     <motion.div
       drag
       dragConstraints={constraints ?? undefined}
       dragElastic={0.2}
-      dragMomentum
+      dragMomentum={!sticker.mobile}
       dragTransition={{ bounceStiffness: 260, bounceDamping: 20 }}
       onDragStart={() => {
         isDraggingRef.current = true
@@ -126,32 +149,45 @@ function FloatingSticker({ sticker, containerRef }) {
       className={`pointer-events-auto absolute flex min-h-[48px] min-w-[48px] cursor-grab touch-none select-none items-center justify-center active:cursor-grabbing ${
         dragging ? 'z-50' : 'z-30'
       }`}
-      style={{ left: sticker.left, top: sticker.top }}
+      style={{ left: sticker.left, top: sticker.top, willChange: 'transform' }}
     >
-      <motion.span
-        className="text-3xl md:text-4xl"
-        style={{ filter: 'drop-shadow(0 5px 8px rgba(30, 41, 59, 0.25))' }}
-        animate={{
-          x: [0, sticker.driftX, 0],
-          y: [0, sticker.driftY, 0],
-          rotate: [-12, 12, -12],
-        }}
-        transition={{
-          duration: sticker.duration,
-          delay: sticker.delay,
-          repeat: Infinity,
-          ease: 'easeInOut',
-        }}
-        whileTap={{ scale: 1.25 }}
-      >
-        {sticker.emoji}
-      </motion.span>
+      {sticker.mobile ? (
+        <motion.span
+          className="text-3xl md:text-4xl"
+          {...staticEmoji}
+          whileTap={{ scale: 1.25 }}
+        >
+          {sticker.emoji}
+        </motion.span>
+      ) : (
+        <motion.span
+          className="text-3xl md:text-4xl"
+          style={{ filter: 'drop-shadow(0 5px 8px rgba(30, 41, 59, 0.25))', willChange: 'transform' }}
+          animate={{
+            x: [0, sticker.driftX, 0],
+            y: [0, sticker.driftY, 0],
+            rotate: [-12, 12, -12],
+          }}
+          transition={{
+            duration: sticker.duration,
+            delay: sticker.delay,
+            repeat: Infinity,
+            ease: 'easeInOut',
+          }}
+          whileTap={{ scale: 1.25 }}
+        >
+          {sticker.emoji}
+        </motion.span>
+      )}
     </motion.div>
   )
 }
 
 export default function FloatingStickers({ containerRef }) {
-  const stickers = useMemo(() => createStickers(), [])
+  // Screens are either mobile or desktop for a session; resolve once so the
+  // whole subtree renders consistently and stays cheap.
+  const mobile = useMemo(() => isMobileViewport(), [])
+  const stickers = useMemo(() => createStickers({ mobile }), [mobile])
 
   return (
     <div aria-hidden="true" className="pointer-events-none fixed inset-0 z-30 overflow-hidden">

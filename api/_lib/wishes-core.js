@@ -46,14 +46,103 @@ const MAX_STRIKES = 3
 // always falls back to `test`.
 const DEFAULT_DATABASE = 'test'
 
+// ---------------------------------------------------------------------------
+// Deterministic profanity guard.
+//
+// Runs BEFORE any AI call. Blatant vulgar words are a solved problem — they
+// should never depend on an external LLM responding on time, on budget, or at
+// all. Anything matched here returns `isAppropriate: false` immediately, so a
+// Groq outage or an unconfigured key can never silently let "fuck" through.
+//
+// Two scans:
+//   A) tokenized text (diacritics preserved) matched by exact token
+//   B) collapsed text (all non-letters removed) matched by 3+ char words,
+//      which catches "f u c k", "f.u.c.k", "f * ck" style circumvention.
+// ---------------------------------------------------------------------------
+
+// Short tokens are ONLY matched as standalone words (Mode A) to avoid false
+// positives like "các em" (các normalizes to "cac", which must NOT match).
+const PROFANITY_WORDS_STRICT = new Set([
+  // English
+  'fuck', 'fucker', 'fucking', 'fck', 'fuk', 'fvck',
+  'shit', 'bitch', 'bastard', 'asshole', 'dick', 'dickhead',
+  'cunt', 'whore', 'slut', 'piss', 'wanker', 'motherfucker',
+  'nigger', 'nigga', 'faggot',
+  // Vietnamese / teencode
+  'địt', 'đụ', 'cặc', 'lồn', 'loz', 'buồi', 'bướm', 'đĩ',
+  'đm', 'dcm', 'clm', 'clmm', 'dmm', 'vcl', 'vkl', 'cc',
+  'ócchó', 'mấtdạy', 'chóđẻ', 'súcsinh', 'khốnnạn', 'ditconbamay', 'ditme',
+])
+
+// 3+ char tokens for the collapsed scan. 'vl' and 'cc' are intentionally
+// absent here: collapsed text glues innocent words together ("chucchuc"
+// contains "cc"), so short codes only match as standalone tokens in Mode A.
+const PROFANITY_WORDS_COLLAPSED = [
+  'fuck', 'fucker', 'fucking', 'fck', 'fuk', 'fvck',
+  'shit', 'bitch', 'bastard', 'asshole', 'dick', 'dickhead',
+  'cunt', 'whore', 'slut', 'piss', 'wanker', 'motherfucker',
+  'nigger', 'nigga', 'faggot',
+  'địt', 'đụ', 'cặc', 'lồn', 'loz', 'buồi', 'bướm', 'đĩ',
+  'đm', 'dcm', 'clm', 'clmm', 'dmm', 'vcl', 'vkl',
+  'ócchó', 'mấtdạy', 'chóđẻ', 'súcsinh', 'khốnnạn', 'ditconbamay', 'ditme',
+]
+
+const VIETNAMESE_LETTERS =
+  'a-zàáảãạăắằẳẵặâấầẩẫậđèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵ'
+
+function normalizeForProfanity(text) {
+  return String(text ?? '')
+    .toLowerCase()
+    // Leetspeak: digits/symbols map back to letters so "@ss", "4ss", "f0ck"
+    // style substitutions still resolve ("f0ck" -> "fock" won't match "fuck",
+    // so those specific variants are kept in the word lists).
+    .replace(/@/g, 'a')
+    .replace(/4/g, 'a')
+    .replace(/0/g, 'o')
+    .replace(/1/g, 'i')
+    .replace(/3/g, 'e')
+    .replace(/5/g, 's')
+}
+
+/**
+ * Returns the first offending token, or null when the text is clean.
+ * Diacritics are preserved so everyday Vietnamese ("các", "chúc") can never
+ * be mistaken for a slur ("cặc").
+ */
+export function findProfanity(input) {
+  const normalized = normalizeForProfanity(input)
+
+  // Mode A — token scan with diacritics intact.
+  const tokenized = normalized
+    .replace(new RegExp(`[^${VIETNAMESE_LETTERS}\\s]`, 'g'), ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+  for (const token of tokenized) {
+    if (token && PROFANITY_WORDS_STRICT.has(token)) return token
+  }
+
+  // Mode B — collapsed scan for spaced / symbol-separated circumvention.
+  const collapsed = normalized.replace(new RegExp(`[^${VIETNAMESE_LETTERS}]`, 'g'), '')
+  for (const word of PROFANITY_WORDS_COLLAPSED) {
+    if (word.length >= 3 && collapsed.includes(word)) return word
+  }
+
+  return null
+}
+
 const MODERATION_SYSTEM_PROMPT = `You are an uncompromising content safety auditor for a family birthday website.
 Your mission: Detect offensive language, vulgarity, profanity, toxicity, insults, sexual harassment, or trolling in both Vietnamese and English.
 
+Profanity is a hard reject: messages containing vulgar/derogatory words (English or Vietnamese/teencode) MUST be flagged isAppropriate: false.
+
 Be extremely vigilant against circumvention techniques:
-1. Spaced words: "d i t", "f u c k", "c a c", "l o n".
+1. Spaced words: "d i t", "f u c k", "l o n".
 2. Symbol/number leetspeak: "d!t", "d1t", "f*ck", "fvck", "l0z", "b**i".
-3. Phonetic spelling & teencode: "đm", "dcm", "clmm", "vcl", "vkl", "đmm", "cc", "loz", "cac", "buoi", "ditconbamay", "dit me", "đụ", "l**n".
+3. Phonetic spelling & teencode: "đm", "dcm", "clmm", "vcl", "vkl", "đmm", "cc", "loz", "ditconbamay", "đụ", "l**n".
 4. Implicit insults or sexually suggestive pranks disguised as jokes.
+
+Note: "cac" is NOT offensive by itself (it is the tonal spelling of innocent "các"); judge its meaning from context — only flag it if it is an intentional profanity substitution.
 
 Analyze both the sender name and the wish message.
 Respond ONLY with raw, valid JSON:
@@ -294,14 +383,24 @@ async function moderateContent({ senderName, message }, groqConfig) {
  *
  * Guarantees a well-formed `{ isAppropriate, reason, bypassed }` result on
  * EVERY exit so the wish-write path can never crash on AI trouble:
- *   - No API key configured  -> bypass: allow the wish without moderation.
- *   - Groq runtime error     -> log `console.warn('Groq AI bypass ...')` then
- *                               allow the wish to proceed to the database.
- *   - Clean verdict          -> surfaced unchanged; the caller keeps the
- *                               existing strike / penalty logic for content
- *                               the model marks inappropriate.
+ *   - Deterministic profanity hit   -> `isAppropriate: false` WITHOUT any AI
+ *                                      call; never depends on Groq being up.
+ *   - No API key configured         -> bypass: allow the wish without AI
+ *                                      moderation (the deterministic guard
+ *                                      still ran and passed).
+ *   - Groq runtime error            -> logged with `console.error`, then the
+ *                                      wish is allowed to proceed (deterministic
+ *                                      guard already cleared it).
+ *   - Clean verdict                 -> surfaced unchanged; the caller keeps the
+ *                                      existing strike / penalty logic for content
+ *                                      the model marks inappropriate.
  */
 async function moderateWish({ senderName, message }, groqConfig) {
+  const flagged = findProfanity(`${senderName} ${message}`)
+  if (flagged) {
+    return { isAppropriate: false, reason: 'Explicit profanity detected', bypassed: false }
+  }
+
   if (!groqConfig.apiKey) {
     console.warn('Groq AI bypass due to missing GROQ_API_KEY:', 'moderation skipped for a new wish')
     return { isAppropriate: true, reason: '', bypassed: true }
@@ -311,6 +410,7 @@ async function moderateWish({ senderName, message }, groqConfig) {
     const verdict = await moderateContent({ senderName, message }, groqConfig)
     return { isAppropriate: verdict.isAppropriate, reason: verdict.reason, bypassed: false }
   } catch (error) {
+    console.error('[Groq Moderation Failed]', error)
     console.warn('Groq AI bypass due to error:', error.message)
     return { isAppropriate: true, reason: '', bypassed: true }
   }
