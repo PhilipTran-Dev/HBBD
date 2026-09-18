@@ -1,14 +1,14 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { motion, useAnimationControls } from 'framer-motion'
 import { Loader2, Mail, MailOpen } from 'lucide-react'
-import {
-  buildFrameConstraints,
-  getBoundingClientRectSafe,
-  getRefRect,
-  isMobileViewport,
-} from '../lib/dom'
+import { buildFrameConstraints, getBoundingClientRectSafe, isMobileViewport } from '../lib/dom'
 
 const MAX_ENVELOPES = 12
+
+// Full-viewport drag padding (px) kept free on every side so a letter can
+// roam the whole screen organically but can never be dragged under the home
+// indicator, the browser chrome, or into a gesture zone.
+const DRAG_PADDING = 16
 
 const ENVELOPE_PALETTES = [
   { bg: 'from-amber-200 to-yellow-300', border: 'border-amber-400', badge: 'bg-amber-100 text-amber-800' },
@@ -27,15 +27,41 @@ function seededUnit(seed) {
   return ((hash >>> 0) % 1000) / 1000
 }
 
+/**
+ * Deterministic full-viewport layout.
+ *
+ * Spawn bands avoid the unsafe zones on a phone: nothing starts inside the
+ * notch/status-bar strip (< ~14% height) and nothing below the action buttons
+ * (> ~75% height). A lone letter gets a centered, comfortable seat near the
+ * upper-middle instead of being parked in a corner under the camera.
+ */
 function buildLayout(wishes) {
-  return wishes.slice(0, MAX_ENVELOPES).map((wish) => {
+  const clamped = wishes.slice(0, MAX_ENVELOPES)
+  if (clamped.length === 1) {
+    const wish = clamped[0]
+    return [
+      {
+        wish: wish,
+        left: '15%',
+        top: '22%',
+        duration: 6 + seededUnit('999-d') * 4,
+        delay: seededUnit('999-t') * 1.2,
+        tilt: -8 + seededUnit('999-r') * 16,
+        palette: ENVELOPE_PALETTES[Number(wish.id) % ENVELOPE_PALETTES.length],
+      },
+    ]
+  }
+
+  return clamped.map((wish) => {
     const key = String(wish.id)
+    // top: 14% -> 72%, always clear of the notch strip and bottom controls.
+    // left: 6% -> 78%, avoids the screen edges and inside-buttons.
     return {
       wish,
-      left: `${3 + seededUnit(`${key}-x`) * 82}%`,
-      top: `${4 + seededUnit(`${key}-y`) * 84}%`,
-      duration: 4 + seededUnit(`${key}-d`) * 2,
-      delay: seededUnit(`${key}-t`) * 1.6,
+      left: `${6 + seededUnit(`${key}-x`) * 72}%`,
+      top: `${14 + seededUnit(`${key}-y`) * 58}%`,
+      duration: 6 + seededUnit(`${key}-d`) * 4,
+      delay: seededUnit(`${key}-t`) * 1.2,
       tilt: -8 + seededUnit(`${key}-r`) * 16,
       palette: ENVELOPE_PALETTES[Number(key) % ENVELOPE_PALETTES.length],
     }
@@ -57,7 +83,6 @@ function FloatingStatus({ children, mobile }) {
 }
 
 function FloatingEnvelope({
-  dragConstraints,
   mobile,
   wish,
   left,
@@ -77,11 +102,10 @@ function FloatingEnvelope({
   // the envelope smoothly back to its slot instead of losing it forever.
   const snapControls = useAnimationControls()
 
-  // Numeric, viewport-relative drag constraints computed from a GUARDED read
-  // of the constraint ref. Framer Motion measures ref-based constraints by
-  // calling `ref.current.getBoundingClientRect()` internally, which throws
-  // `e.getBoundingClientRect is not a function` when the ref is detached. A
-  // fixed box never touches a live ref, so it cannot crash.
+  // Numeric drag constraints bound to the full viewport with a DRAG_PADDING
+  // bumper on every side. Computed as pure math (no live ref measurement —
+  // framer-motion throws `e.getBoundingClientRect is not a function` when a
+  // constraint ref detaches), so signing a drag can never crash.
   //
   // The envelope is square in both breakpoints (w-20/h-20 = 80px,
   // sm:w-24/sm:h-24 = 96px), so width and height always match.
@@ -91,23 +115,20 @@ function FloatingEnvelope({
     const size = isSm ? 96 : 80
 
     const compute = () => {
-      // Prefer the parent canvas rect; fall back to a viewport-sized safe box
-      // so constraints stay valid even before/after scroll or layout changes.
-      const frame =
-        getRefRect(dragConstraints) ??
-        (() => {
-          const width = typeof window !== 'undefined' ? window.innerWidth : 0
-          const height = typeof window !== 'undefined' ? window.innerHeight : 0
-          return {
-            left: 0,
-            top: 0,
-            width,
-            height: Math.round(height * 0.6),
-            right: width,
-            bottom: Math.round(height * 0.6),
-          }
-        })()
-      return buildFrameConstraints(frame, { left, top, width: size, height: size })
+      if (typeof window === 'undefined') return null
+      const width = window.innerWidth
+      const height = window.innerHeight
+      // Shrink the frame by DRAG_PADDING on each side; buildFrameConstraints
+      // then keeps the envelope's full box inside that region.
+      const paddedFrame = {
+        left: DRAG_PADDING,
+        top: DRAG_PADDING,
+        width: width - DRAG_PADDING * 2,
+        height: height - DRAG_PADDING * 2,
+        right: width - DRAG_PADDING,
+        bottom: height - DRAG_PADDING,
+      }
+      return buildFrameConstraints(paddedFrame, { left, top, width: size, height: size })
     }
 
     let alive = true
@@ -127,7 +148,7 @@ function FloatingEnvelope({
       cancelAnimationFrame(frameId)
       window.removeEventListener('resize', onResize)
     }
-  }, [dragConstraints, left, top])
+  }, [left, top])
 
   const handleClick = (event) => {
     // A drag / hold-and-move must never open the letter modal. Only a clean,
@@ -146,18 +167,20 @@ function FloatingEnvelope({
       isDraggingRef.current = false
     }, 100)
 
-    // Boundary recovery: if the envelope was flung past the visible safe area,
+    // Boundary recovery: if the envelope was flung past the padded viewport
+    // region (a hard fling can overshoot the elastic on desktop momentum),
     // tween it smoothly back to its slot (x/y -> 0 returns to the CSS
-    // left/top position). Momentum on mobile is off, but this also guards the
-    // desktop path where a strong fling can overshoot the elastic.
+    // left/top position).
     const rect = getBoundingClientRectSafe(event?.currentTarget)
     if (!rect) return
-    const right =
-      typeof window !== 'undefined' ? window.innerWidth : Math.max(rect.right, rect.left)
-    const bottom =
-      typeof window !== 'undefined' ? window.innerHeight * 0.6 : Math.max(rect.bottom, rect.top)
+    if (typeof window === 'undefined') return
+    const safeRight = window.innerWidth - DRAG_PADDING
+    const safeBottom = window.innerHeight - DRAG_PADDING
     const outOfBounds =
-      rect.left < 0 || rect.top < 0 || rect.right > right || rect.bottom > bottom
+      rect.left < DRAG_PADDING ||
+      rect.top < DRAG_PADDING ||
+      rect.right > safeRight ||
+      rect.bottom > safeBottom
     if (outOfBounds) {
       snapControls.start({
         x: 0,
@@ -187,16 +210,16 @@ function FloatingEnvelope({
       whileDrag={{ scale: 1.15, zIndex: 40, cursor: 'grabbing' }}
       aria-label={`Mở thư của ${wish.sender_name}`}
       className="pointer-events-auto absolute z-30 flex h-20 w-20 cursor-grab touch-none select-none flex-col items-center justify-center focus:outline-none focus-visible:ring-4 focus-visible:ring-amber-300 active:cursor-grabbing sm:h-24 sm:w-24"
-      style={{ left, top, willChange: 'transform' }}
+      style={{ left, top, willChange: 'transform', transform: 'translate3d(0, 0, 0)' }}
     >
       <motion.div
         animate={
           paused
             ? { y: 0, x: 0, rotate: tilt }
             : {
-                y: [-10, 10, -10],
-                x: [-5, 5, -5],
-                rotate: [tilt - 3, tilt + 3, tilt - 3],
+                y: [0, -26, 14, -16, 0],
+                x: [0, 16, -12, 10, 0],
+                rotate: [tilt - 5, tilt + 6, tilt - 4, tilt + 4, tilt],
               }
         }
         transition={{
@@ -206,7 +229,7 @@ function FloatingEnvelope({
           ease: 'easeInOut',
         }}
         className={`relative grid h-14 w-14 place-items-center rounded-2xl border-2 ${palette.border} bg-gradient-to-br ${palette.bg} shadow-lg sm:h-16 sm:w-16`}
-        style={{ willChange: 'transform' }}
+        style={{ willChange: 'transform', transform: 'translate3d(0, 0, 0)' }}
       >
         <Mail className="h-7 w-7 text-slate-800 sm:h-8 sm:w-8" />
         <span className="absolute -right-2 -top-2 text-base">💌</span>
@@ -225,15 +248,11 @@ export default function WishesBoard({
   onOpenWish,
   pausedId,
 }) {
-  const canvasRef = useRef(null)
   const mobile = useMemo(() => isMobileViewport(), [])
   const items = useMemo(() => buildLayout(wishes), [wishes])
 
   return (
-    <div
-      ref={canvasRef}
-      className="pointer-events-none fixed inset-x-0 top-[2%] z-30 h-[55vh] overflow-hidden"
-    >
+    <div className="pointer-events-none fixed inset-0 z-30 overflow-hidden">
       {loading && (
         <FloatingStatus mobile={mobile}>
           <Loader2 className="h-4 w-4 animate-spin text-amber-500" />
@@ -266,7 +285,6 @@ export default function WishesBoard({
         items.map(({ wish, left, top, duration, delay, tilt, palette }) => (
           <FloatingEnvelope
             key={wish.id}
-            dragConstraints={canvasRef}
             mobile={mobile}
             wish={wish}
             left={left}
