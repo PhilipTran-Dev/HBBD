@@ -1,55 +1,48 @@
-import { createWishesApi, resolveIp } from './_lib/wishes-core.js'
-
-let api = null
-
-function getApi() {
-  if (!api) api = createWishesApi()
-  return api
-}
-
-function send(res, status, payload) {
-  res.statusCode = status
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
-  res.end(payload === undefined ? '' : JSON.stringify(payload))
-}
-
 /**
- * Vercel serverless function serving `/api/check-status`.
+ * Zero-dependency health / status endpoint.
  *
- * Returns the current rate-limit / lock state for the caller's IP plus a
- * lightweight health signature so uptime monitors and the client can confirm
- * the API is alive.
+ * Deliberately imports NOTHING: no database driver, no shared API core, no
+ * network calls. A health check must report function-runtime liveness and
+ * environment presence flags even when every backend dependency is broken or
+ * misconfigured — the very failure mode that previously turned this endpoint
+ * into a 500 because it imported `_lib/wishes-core.js` (which statically
+ * imported the TiDB driver at module top level).
+ *
+ * Returns 200 on both GET and OPTIONS (CORS preflight), so curl, browsers,
+ * and uptime monitors all see a live function regardless of DB state.
  */
-export default async function handler(req, res) {
+export default function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Credentials', true)
   res.setHeader('Access-Control-Allow-Origin', '*')
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET,OPTIONS',
+  )
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version',
+  )
 
   if (req.method === 'OPTIONS') {
-    res.statusCode = 204
-    res.end()
-    return
+    return res.status(200).end()
   }
 
   if (req.method !== 'GET') {
-    send(res, 405, { status: 'error', error: 'Method not allowed' })
-    return
+    return res
+      .status(405)
+      .json({ status: 'error', error: 'Method not allowed' })
   }
 
-  try {
-    const status = await getApi().getStatus(resolveIp(req))
-    const payload = {
-      status: 'ok',
-      timestamp: Date.now(),
-      blocked: status.blocked,
-      strikes: status.strikes,
-    }
-    if (status.blocked) {
-      payload.reason = status.reason
-      payload.remainingSeconds = status.remainingSeconds
-    }
-    send(res, 200, payload)
-  } catch (error) {
-    send(res, 500, { status: 'error', error: String(error?.message ?? error) })
-  }
+  return res.status(200).json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    env: {
+      hasTiDBHost: !!process.env.TIDB_HOST,
+      hasTiDBUser: !!process.env.TIDB_USER,
+      hasTiDBPass: !!process.env.TIDB_PASSWORD,
+      hasTiDBDatabase: !!process.env.TIDB_DATABASE,
+      hasDATABASE_URL: !!process.env.DATABASE_URL,
+      hasGroqKey: !!process.env.GROQ_API_KEY,
+    },
+  })
 }

@@ -1,23 +1,12 @@
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { defineConfig, loadEnv } from 'vite'
-import { createWishesApi, resolveIp } from './api/_lib/wishes-core.js'
-
-function send(res, status, payload) {
-  res.statusCode = status
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
-  res.end(payload === undefined ? '' : JSON.stringify(payload))
-}
-
-async function readBody(req) {
-  let raw = ''
-  for await (const chunk of req) raw += chunk
-  try {
-    return raw ? JSON.parse(raw) : {}
-  } catch {
-    return null
-  }
-}
+import {
+  ConfigError,
+  createWishesApi,
+  resolveIp,
+} from './api/_lib/wishes-core.js'
+import { send, isPreflight, readBody } from './api/_lib/http.js'
 
 function mapCreateResult(result) {
   switch (result.kind) {
@@ -54,7 +43,7 @@ function mapCreateResult(result) {
         },
       }
     default:
-      return { status: 200, payload: { ok: true } }
+      return { status: 200, payload: { ok: true, data: result.wish ?? null } }
   }
 }
 
@@ -71,7 +60,7 @@ function tidbWishesApi({ env }) {
 
   const middleware = async (req, res, next) => {
     const path = req.url?.split('?')[0]
-    if (path !== '/api/wishes' && path !== '/api/check-status') {
+    if (path !== '/api/wishes' && path !== '/api/check-status' && path !== '/api/wishes/status') {
       next()
       return
     }
@@ -79,7 +68,40 @@ function tidbWishesApi({ env }) {
     try {
       api ??= createWishesApi({ env })
 
+      // Dev parity with the PRODUCTION health probe: env flags only, no DB
+      // access, so this route never 500s because the backend is misconfigured.
       if (path === '/api/check-status') {
+        if (isPreflight(req)) {
+          res.statusCode = 204
+          res.end()
+          return
+        }
+        if (req.method !== 'GET') {
+          send(res, 405, { ok: false, error: 'Method not allowed' })
+          return
+        }
+        send(res, 200, {
+          status: 'healthy',
+          timestamp: new Date().toISOString(),
+          env: {
+            hasTiDBHost: !!env.TIDB_HOST,
+            hasTiDBUser: !!env.TIDB_USER,
+            hasTiDBPass: !!env.TIDB_PASSWORD,
+            hasTiDBDatabase: !!env.TIDB_DATABASE,
+            hasDATABASE_URL: !!env.DATABASE_URL,
+            hasGroqKey: !!env.GROQ_API_KEY,
+          },
+        })
+        return
+      }
+
+      // Dev parity with api/wishes/status.js — database-backed lock state.
+      if (path === '/api/wishes/status') {
+        if (isPreflight(req)) {
+          res.statusCode = 204
+          res.end()
+          return
+        }
         if (req.method !== 'GET') {
           send(res, 405, { ok: false, error: 'Method not allowed' })
           return
@@ -100,6 +122,11 @@ function tidbWishesApi({ env }) {
       }
 
       // /api/wishes
+      if (isPreflight(req)) {
+        res.statusCode = 204
+        res.end()
+        return
+      }
       if (req.method === 'GET') {
         send(res, 200, await api.getWishes())
         return
@@ -127,6 +154,11 @@ function tidbWishesApi({ env }) {
       )
       send(res, status, payload)
     } catch (error) {
+      if (error instanceof ConfigError) {
+        send(res, error.statusCode ?? 503, { ok: false, error: error.message })
+        return
+      }
+      console.error('[tidb-wishes-api]', error)
       send(res, 500, { ok: false, error: String(error?.message ?? error) })
     }
   }

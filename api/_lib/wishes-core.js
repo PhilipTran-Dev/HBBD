@@ -1,10 +1,39 @@
-import { connect } from '@tidbcloud/serverless'
+/**
+ * Shared wishes API core — safe to import from BOTH the Vite middleware
+ * (vite.config.js) and the Vercel serverless functions (api/wishes.js).
+ *
+ * Boot-safety contract (the reason this module is structured the way it is):
+ *
+ * 1. NO external client is created at module top level. `connect()` and the
+ *    Groq client are loaded lazily inside guarded getters (`getConnect`,
+ *    `getGroq`), and only when a request actually needs them. If environment
+ *    variables are missing or the vendor modules fail to resolve, the function
+ *    container still boots a valid handler instead of crashing on import.
+ * 2. Every config failure throws a typed `ConfigError` carrying a stable
+ *    `statusCode`, so handlers can answer 503 "I'm up, backend isn't
+ *    configured" instead of a misleading 500.
+ * 3. `check-status.js` deliberately does NOT import this module: a health
+ *    check must stay zero-dependency so it can never be brought down by a
+ *    database/driver failure.
+ *
+ * Database credentials are resolved the same way on Vercel and locally:
+ *   - `DATABASE_URL` if set (a full `mysql://` connection string), otherwise
+ *   - composed from `TIDB_HOST`, `TIDB_USER`, `TIDB_PASSWORD`, and
+ *     `TIDB_DATABASE` (defaulting to `test`).
+ */
+
+export class ConfigError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'ConfigError'
+    this.statusCode = 503
+  }
+}
 
 const COOLDOWN_SECONDS = 30 * 60
 const LOCKOUT_SECONDS = 30 * 60
 const MAX_STRIKES = 3
-
-const GROQ_ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions'
+const DEFAULT_DATABASE = 'test'
 
 const MODERATION_SYSTEM_PROMPT = `You are an uncompromising content safety auditor for a family birthday website.
 Your mission: Detect offensive language, vulgarity, profanity, toxicity, insults, sexual harassment, or trolling in both Vietnamese and English.
@@ -55,6 +84,12 @@ const INSERT_WISH_SQL = `
   INSERT INTO birthday_wishes (sender_name, message, ip_address) VALUES (?, ?, ?)
 `
 
+const SELECT_WISH_BY_ID_SQL = `
+  SELECT id, sender_name, message, created_at
+    FROM birthday_wishes
+   WHERE id = ?
+`
+
 const GET_RATE_LIMITS_SQL = `
   SELECT strike_count,
          TIMESTAMPDIFF(SECOND, NOW(), blocked_until) AS block_remaining,
@@ -78,21 +113,31 @@ const UPSERT_BLOCK_SQL = `
 const UPDATE_STRIKE_SQL = `UPDATE ip_rate_limits SET strike_count = ? WHERE ip_address = ?`
 const INSERT_STRIKE_SQL = `INSERT INTO ip_rate_limits (ip_address, strike_count) VALUES (?, ?)`
 
-export function requireEnv(value, name) {
+function requireEnv(value, name) {
   if (!value) {
-    throw new Error(
-      `Missing required environment variable "${name}". Copy .env.example to .env and fill it in.`,
+    throw new ConfigError(
+      `Missing required environment variable "${name}". Copy .env.example to .env and fill it in, then add it to the Vercel project settings.`,
     )
   }
   return value
 }
 
+/**
+ * Resolve the TiDB connection string.
+ * Precedence: DATABASE_URL (full mysql:// URL) > TIDB_HOST/TIDB_USER/
+ * TIDB_PASSWORD (+ TIDB_DATABASE, default `test`).
+ */
 export function resolveDbConfig(env) {
+  const url = env.DATABASE_URL ?? env.TIDB_URL
+  if (url) return { url }
+
+  const host = requireEnv(env.TIDB_HOST, 'TIDB_HOST')
+  const username = requireEnv(env.TIDB_USER, 'TIDB_USER')
+  const password = requireEnv(env.TIDB_PASSWORD, 'TIDB_PASSWORD')
+  const database = env.TIDB_DATABASE ?? DEFAULT_DATABASE
+
   return {
-    host: requireEnv(env.TIDB_HOST, 'TIDB_HOST'),
-    username: requireEnv(env.TIDB_USER, 'TIDB_USER'),
-    password: requireEnv(env.TIDB_PASSWORD, 'TIDB_PASSWORD'),
-    database: requireEnv(env.TIDB_DATABASE, 'TIDB_DATABASE'),
+    url: `mysql://${encodeURIComponent(username)}:${encodeURIComponent(password)}@${host}/${database}?sslaccept=strict`,
   }
 }
 
@@ -110,6 +155,38 @@ export function resolveIp(req) {
     if (first) return first
   }
   return req.socket?.remoteAddress || '127.0.0.1'
+}
+
+// ---------------------------------------------------------------------------
+// Lazy, guarded external-client getters. Nothing below instantiates a vendor
+// client until a request needs it, so a missing package or env var can never
+// crash the function at module-load time.
+// ---------------------------------------------------------------------------
+
+let connectPromise = null
+
+function getConnect() {
+  if (!connectPromise) {
+    connectPromise = import('@tidbcloud/serverless').then((mod) => mod.connect)
+    // A resolution failure must not stick forever: allow a later request to
+    // retry instead of caching the rejection.
+    connectPromise.catch(() => {
+      connectPromise = null
+    })
+  }
+  return connectPromise
+}
+
+let groqModulePromise = null
+
+function getGroqModule() {
+  if (!groqModulePromise) {
+    groqModulePromise = import('groq-sdk')
+    groqModulePromise.catch(() => {
+      groqModulePromise = null
+    })
+  }
+  return groqModulePromise
 }
 
 function extractJson(text) {
@@ -156,37 +233,29 @@ function buildBlockStatus(row) {
 }
 
 async function readLimits(db, ip) {
-  return db.execute(GET_RATE_LIMITS_SQL, [ip]).then((rows) => rows?.[0] ?? null)
+  const rows = await db.execute(GET_RATE_LIMITS_SQL, [ip])
+  return rows?.[0] ?? null
 }
 
 async function moderateContent({ senderName, message }, groqConfig) {
-  const response = await fetch(GROQ_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${groqConfig.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: groqConfig.model,
-      temperature: 0,
-      max_completion_tokens: 400,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: MODERATION_SYSTEM_PROMPT },
-        { role: 'user', content: JSON.stringify({ senderName, message }) },
-      ],
-    }),
+  const { default: Groq } = await getGroqModule()
+  const client = new Groq({ apiKey: groqConfig.apiKey })
+
+  const response = await client.chat.completions.create({
+    model: groqConfig.model,
+    temperature: 0,
+    max_completion_tokens: 400,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: MODERATION_SYSTEM_PROMPT },
+      { role: 'user', content: JSON.stringify({ senderName, message }) },
+    ],
   })
 
-  if (!response.ok) {
-    throw new Error(`Groq moderation failed (${response.status})`)
-  }
-
-  const data = await response.json()
-  const verdict = extractJson(data?.choices?.[0]?.message?.content)
+  const verdict = extractJson(response?.choices?.[0]?.message?.content)
 
   if (!verdict || typeof verdict.isAppropriate !== 'boolean') {
-    throw new Error('Groq returned an unreadable verdict')
+    throw new Error('Groq returned an unreadable moderation verdict')
   }
 
   return {
@@ -201,16 +270,32 @@ async function moderateContent({ senderName, message }, groqConfig) {
  * (api/check-status.js, api/wishes.js).
  *
  * Reads its configuration from the passed `env` object, defaulting to
- * `process.env` (the Vercel runtime's environment variables).
+ * `process.env` (the Vercel runtime's environment variables). No external
+ * client is created until the first request.
  */
 export function createWishesApi({ env = process.env } = {}) {
-  const db = connect(resolveDbConfig(env))
+  const dbConfig = resolveDbConfig(env)
   const groqConfig = resolveGroqConfig(env)
+
+  let dbPromise = null
   let schemaReady = null
+
+  const getDb = () => {
+    if (!dbPromise) {
+      dbPromise = getConnect()
+        .then((connect) => connect(dbConfig))
+        .catch((error) => {
+          dbPromise = null
+          throw error
+        })
+    }
+    return dbPromise
+  }
 
   const ensureSchema = () => {
     if (!schemaReady) {
       schemaReady = (async () => {
+        const db = await getDb()
         await db.execute(CREATE_WISHES_TABLE_SQL)
         await db.execute(ALTER_WISHES_IP_SQL)
         await db.execute(CREATE_RATE_LIMITS_SQL)
@@ -224,7 +309,7 @@ export function createWishesApi({ env = process.env } = {}) {
 
   const getWishes = async () => {
     await ensureSchema()
-    const rows = await db.execute(SELECT_WISHES_SQL)
+    const rows = await (await getDb()).execute(SELECT_WISHES_SQL)
     // Intentionally never expose ip_address to the client.
     return (rows ?? []).map((row) => ({
       id: row.id,
@@ -236,11 +321,12 @@ export function createWishesApi({ env = process.env } = {}) {
 
   const getStatus = async (ip) => {
     await ensureSchema()
-    return buildBlockStatus(await readLimits(db, ip))
+    return buildBlockStatus(await readLimits(await getDb(), ip))
   }
 
   const createWish = async ({ ip, senderName, message }) => {
     await ensureSchema()
+    const db = await getDb()
     const status = buildBlockStatus(await readLimits(db, ip))
 
     if (status.blocked) {
@@ -281,9 +367,29 @@ export function createWishesApi({ env = process.env } = {}) {
       }
     }
 
-    await db.execute(INSERT_WISH_SQL, [senderName, message, ip])
+    const inserted = await db.execute(INSERT_WISH_SQL, [senderName, message, ip], {
+      fullResult: true,
+    })
+    const wishId = inserted?.lastInsertId ?? inserted?.rows?.[0]?.id
     await db.execute(UPSERT_SUCCESS_SQL, [ip])
-    return { kind: 'ok' }
+
+    // Return the freshly inserted record to the caller.
+    const record =
+      wishId == null
+        ? { sender_name: senderName, message }
+        : (await db.execute(SELECT_WISH_BY_ID_SQL, [wishId]))?.[0] ?? null
+
+    return {
+      kind: 'ok',
+      wish: record
+        ? {
+            id: record.id,
+            sender_name: record.sender_name ?? '',
+            message: record.message ?? '',
+            created_at: record.created_at ?? null,
+          }
+        : { sender_name: senderName, message },
+    }
   }
 
   return { getWishes, getStatus, createWish }

@@ -1,26 +1,16 @@
-import { createWishesApi, resolveIp } from './_lib/wishes-core.js'
+import { ConfigError, createWishesApi, resolveIp } from './_lib/wishes-core.js'
+import { send, isPreflight, readBody } from './_lib/http.js'
 
 let api = null
 
+/**
+ * Returns a shared, lazily-created API handle. `createWishesApi` itself only
+ * resolves configuration and never instantiates an external client, so this
+ * can run safely inside the handler (and therefore inside its try/catch).
+ */
 function getApi() {
   if (!api) api = createWishesApi()
   return api
-}
-
-function send(res, status, payload) {
-  res.statusCode = status
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
-  res.end(payload === undefined ? '' : JSON.stringify(payload))
-}
-
-async function readBody(req) {
-  let raw = ''
-  for await (const chunk of req) raw += chunk
-  try {
-    return raw ? JSON.parse(raw) : {}
-  } catch {
-    return null
-  }
 }
 
 function mapCreateResult(result) {
@@ -58,7 +48,7 @@ function mapCreateResult(result) {
         },
       }
     default:
-      return { status: 200, payload: { ok: true } }
+      return { status: 200, payload: { ok: true, data: result.wish ?? null } }
   }
 }
 
@@ -66,16 +56,25 @@ function mapCreateResult(result) {
  * Vercel serverless function serving `/api/wishes`.
  *
  * GET  — fetch all wishes from TiDB Cloud Serverless.
- * POST — validate the payload, run Groq AI moderation, insert into TiDB
- *        Cloud, and return the outcome. Rate-limit / strike bookkeeping is
- *        enforced server-side.
+ * POST — validate the payload, run Groq AI moderation (a JSON-generation task:
+ *        the model must return `{ isAppropriate, reason }` for the submitted
+ *        wish), insert the approved wish into TiDB Cloud, and return the
+ *        inserted record. Rate-limit / strike bookkeeping is enforced
+ *        server-side.
+ *
+ * Every failure path is caught and answered with structured JSON — a thrown
+ * error here can never bubble up as a bare 500 or crash the process.
  */
 export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Credentials', true)
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version',
+  )
 
-  if (req.method === 'OPTIONS') {
+  if (isPreflight(req)) {
     res.statusCode = 204
     res.end()
     return
@@ -83,8 +82,7 @@ export default async function handler(req, res) {
 
   try {
     if (req.method === 'GET') {
-      const wishes = await getApi().getWishes()
-      send(res, 200, wishes)
+      send(res, 200, await getApi().getWishes())
       return
     }
 
@@ -101,6 +99,7 @@ export default async function handler(req, res) {
 
     const senderName = String(body.sender_name ?? '').trim()
     const message = String(body.message ?? '').trim()
+
     if (!senderName || !message) {
       send(res, 400, { ok: false, error: 'sender_name and message are required' })
       return
@@ -111,6 +110,13 @@ export default async function handler(req, res) {
     )
     send(res, status, payload)
   } catch (error) {
+    if (error instanceof ConfigError) {
+      // Backend is alive but misconfigured: report it as such (503) so
+      // failures read as "missing env config" rather than "app crashed".
+      send(res, error.statusCode ?? 503, { ok: false, error: error.message })
+      return
+    }
+    console.error('[api/wishes]', error)
     send(res, 500, { ok: false, error: String(error?.message ?? error) })
   }
 }

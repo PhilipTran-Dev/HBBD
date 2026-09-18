@@ -16,7 +16,7 @@ export async function fetchWishes() {
 }
 
 export async function fetchSubmissionStatus() {
-  const response = await fetch('/api/check-status')
+  const response = await fetch('/api/wishes/status')
   if (!response.ok) {
     throw new Error(`Không kiểm tra được trạng thái (${response.status})`)
   }
