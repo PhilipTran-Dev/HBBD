@@ -1,5 +1,8 @@
-import { useMemo, useRef, useState } from 'react'
+import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
+import { buildFrameConstraints, getRefRect } from '../lib/dom'
+
+const STICKER_SIZE = 48
 
 const STICKER_POOL = [
   '🌼',
@@ -69,6 +72,31 @@ function FloatingSticker({ sticker, containerRef }) {
   const isDraggingRef = useRef(false)
   const [dragging, setDragging] = useState(false)
 
+  // Numeric, viewport-relative drag constraints computed from a GUARDED read
+  // of the container ref. Framer Motion measures ref-based constraints by
+  // calling `ref.current.getBoundingClientRect()` internally, which throws
+  // `e.getBoundingClientRect is not a function` when the ref is detached. A
+  // fixed box never touches a live ref, so it cannot crash.
+  const [constraints, setConstraints] = useState(null)
+  useLayoutEffect(() => {
+    let alive = true
+    const frameId = requestAnimationFrame(() => {
+      if (!alive) return
+      setConstraints(
+        buildFrameConstraints(getRefRect(containerRef), {
+          left: sticker.left,
+          top: sticker.top,
+          width: STICKER_SIZE,
+          height: STICKER_SIZE,
+        }),
+      )
+    })
+    return () => {
+      alive = false
+      cancelAnimationFrame(frameId)
+    }
+  }, [containerRef, sticker.left, sticker.top])
+
   const handleClick = (event) => {
     if (isDraggingRef.current) {
       event.stopPropagation()
@@ -79,7 +107,7 @@ function FloatingSticker({ sticker, containerRef }) {
   return (
     <motion.div
       drag
-      dragConstraints={containerRef}
+      dragConstraints={constraints ?? undefined}
       dragElastic={0.2}
       dragMomentum
       dragTransition={{ bounceStiffness: 260, bounceDamping: 20 }}

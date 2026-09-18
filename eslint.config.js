@@ -18,4 +18,13 @@ export default defineConfig([
       parserOptions: { ecmaFeatures: { jsx: true } },
     },
   },
+  {
+    // Serverless functions and Node-runnable tooling execute on the Node/Vercel
+    // runtime, where process, require, and friends are provided by the host,
+    // not the browser.
+    files: ['api/**/*.js', 'vite.config.js', 'eslint.config.js'],
+    languageOptions: {
+      globals: { ...globals.node },
+    },
+  },
 ])

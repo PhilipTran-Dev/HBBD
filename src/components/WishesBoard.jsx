@@ -1,6 +1,7 @@
-import { useMemo, useRef } from 'react'
+import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
 import { Loader2, Mail, MailOpen } from 'lucide-react'
+import { buildFrameConstraints, getRefRect } from '../lib/dom'
 
 const MAX_ENVELOPES = 12
 
@@ -60,6 +61,36 @@ function FloatingEnvelope({
   // release, absorbing the synthetic click browsers emit on touch-up.
   const isDraggingRef = useRef(false)
 
+  // Numeric, viewport-relative drag constraints computed from a GUARDED read
+  // of the constraint ref. Framer Motion measures ref-based constraints by
+  // calling `ref.current.getBoundingClientRect()` internally, which throws
+  // `e.getBoundingClientRect is not a function` when the ref is detached. A
+  // fixed box never touches a live ref, so it cannot crash.
+  //
+  // The envelope is square in both breakpoints (w-20/h-20 = 80px,
+  // sm:w-24/sm:h-24 = 96px), so width and height always match.
+  const [constraints, setConstraints] = useState(null)
+  useLayoutEffect(() => {
+    let alive = true
+    const frameId = requestAnimationFrame(() => {
+      if (!alive) return
+      const isSm = typeof window !== 'undefined' && window.matchMedia('(min-width: 640px)').matches
+      const size = isSm ? 96 : 80
+      setConstraints(
+        buildFrameConstraints(getRefRect(dragConstraints), {
+          left,
+          top,
+          width: size,
+          height: size,
+        }),
+      )
+    })
+    return () => {
+      alive = false
+      cancelAnimationFrame(frameId)
+    }
+  }, [dragConstraints, left, top])
+
   const handleClick = (event) => {
     // A drag / hold-and-move must never open the letter modal. Only a clean,
     // deliberate tap without any pointer displacement should.
@@ -74,7 +105,7 @@ function FloatingEnvelope({
     <motion.button
       type="button"
       drag
-      dragConstraints={dragConstraints}
+      dragConstraints={constraints ?? undefined}
       dragElastic={0.25}
       dragMomentum
       dragTransition={{ power: 0.4, bounceStiffness: 260, bounceDamping: 20 }}
