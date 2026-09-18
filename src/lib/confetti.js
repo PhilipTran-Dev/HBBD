@@ -34,6 +34,27 @@ export function fireSubmissionBurst() {
   })
 }
 
+export function fireCandleBlow() {
+  confetti({
+    particleCount: 90,
+    spread: 100,
+    startVelocity: 40,
+    origin: { y: 0.55 },
+    colors: SPRING_COLORS,
+    scalar: 1,
+  })
+  confetti({
+    particleCount: 45,
+    spread: 360,
+    startVelocity: 18,
+    gravity: 0.5,
+    ticks: 160,
+    origin: { y: 0.8 },
+    colors: SPRING_COLORS,
+    scalar: 0.9,
+  })
+}
+
 function burst() {
   confetti({
     particleCount: 3,

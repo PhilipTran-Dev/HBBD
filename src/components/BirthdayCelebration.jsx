@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { motion, useAnimationControls } from 'framer-motion'
-import { Clock, Loader2, Send, Sparkles } from 'lucide-react'
+import { Clock, Loader2, Send } from 'lucide-react'
 import Toast from './Toast'
 import WishModal from './WishModal'
 import WishesBoard from './WishesBoard'
@@ -281,14 +281,19 @@ export default function BirthdayCelebration({ photoSrc }) {
       <div className="relative mx-auto flex w-full max-w-md flex-col gap-6">
         {/* Celebration hero */}
         <section className="relative overflow-hidden rounded-[2rem] border border-white/70 bg-white/60 px-5 pb-8 pt-7 text-center shadow-xl backdrop-blur">
-          <motion.div
-            initial={{ y: -16, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            transition={{ type: 'spring', stiffness: 180, damping: 16 }}
-            className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-100/80 px-4 py-1.5 text-[11px] font-black uppercase tracking-widest text-amber-700 shadow-sm"
+<motion.div
+            initial={{ y: -14, opacity: 0, scale: 0.6 }}
+            animate={{ y: 0, opacity: 1, scale: 1 }}
+            transition={{ type: 'spring', stiffness: 200, damping: 15 }}
+            className="flex items-center justify-center"
           >
-            <Sparkles className="h-3.5 w-3.5" />
-
+            <span
+              role="img"
+              aria-label="Đính lên bảng"
+              className="inline-block -rotate-6 text-3xl drop-shadow-sm"
+            >
+              📌
+            </span>
           </motion.div>
 
           <h1 className="mt-4 text-4xl font-black leading-tight text-slate-800 sm:text-[2.6rem]">

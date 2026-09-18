@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion, useAnimationControls } from 'framer-motion'
 import BirthdayCelebration from './components/BirthdayCelebration'
+import BlowCandle from './components/BlowCandle'
 import CardStack from './components/CardStack'
 import FloatingStickers from './components/FloatingStickers'
 import MuteButton from './components/MuteButton'
@@ -18,7 +19,7 @@ export default function App() {
   const [trollVisible, setTrollVisible] = useState(false)
   const [isShaking, setIsShaking] = useState(false)
 
-  const { isMuted, playTrack, toggleMute } = useBackgroundMusic()
+  const { isMuted, pauseAll, playTrack, toggleMute } = useBackgroundMusic()
   const shakeControls = useAnimationControls()
   const trollTimer = useRef(null)
   const stageRef = useRef(null)
@@ -55,7 +56,10 @@ export default function App() {
     if (cards[0].isMain) {
       clearTrollTimer()
       setTrollVisible(false)
-      setGameState('SUCCESS')
+      // The candle-blowing stage pauses the game music; the celebration track
+      // starts once the candle is extinguished.
+      pauseAll()
+      setGameState('BLOW_CANDLE')
       return
     }
 
@@ -66,7 +70,7 @@ export default function App() {
       transition: { duration: 0.4, ease: 'easeInOut' },
     })
     setIsShaking(false)
-  }, [gameState, cards, clearTrollTimer, showTroll, shakeControls])
+  }, [gameState, cards, clearTrollTimer, showTroll, shakeControls, pauseAll])
 
   useEffect(() => {
     if (gameState !== 'PLAYING') return undefined
@@ -163,6 +167,14 @@ export default function App() {
               </div>
             </motion.div>
           </motion.main>
+        )}
+
+        {gameState === 'BLOW_CANDLE' && (
+          <BlowCandle
+            key="blow-candle"
+            onCelebrate={() => playTrack('celebration')}
+            onComplete={() => setGameState('SUCCESS')}
+          />
         )}
 
         {gameState === 'SUCCESS' && (
