@@ -40,11 +40,16 @@ export function isMobileViewport() {
 }
 
 /**
- * Build viewport-frame drag constraints that framer-motion interprets as
- * offsets relative to the dragged element's own layout box, so the element
- * stays inside `frame`.
+ * Build numeric drag constraints for framer-motion.
  *
- * @param {DOMRect} frame - the constraint container's rect (viewport coords)
+ * Numeric `dragConstraints` are NOT viewport coords — they are the allowed
+ * min/max of the element's x/y transform deltas measured FROM its initial
+ * rendered CSS position (x=y=0 at rest). So to keep the element's full box
+ * inside the safe `frame` region:
+ *   min = frameEdge - elementOffset        (top/left edges of the frame)
+ *   max = frameEdge - elementOffset - size (right/bottom edges of the frame)
+ *
+ * @param {DOMRect} frame - the safe region in viewport coords
  * @param {{ left: string, top: string, width: number, height: number }} item
  *   - the drag item's CSS `left`/`top` percentages within the frame and its
  *     pixel size. Pure math only — no live element is measured.
@@ -56,11 +61,9 @@ export function buildFrameConstraints(frame, item) {
   const topPx = (parseFloat(item.top) / 100) * frame.height
 
   return {
-    // framer: min = layoutAxis.min + value  =>  element left edge stops at frame.left
-    left: frame.left - 2 * leftPx,
-    // framer: max = layoutAxis.max + value - length  =>  right edge stops at frame.right
-    right: frame.right - 2 * leftPx - item.width,
-    top: frame.top - 2 * topPx,
-    bottom: frame.bottom - 2 * topPx - item.height,
+    left: frame.left - leftPx,
+    right: frame.right - leftPx - item.width,
+    top: frame.top - topPx,
+    bottom: frame.bottom - topPx - item.height,
   }
 }

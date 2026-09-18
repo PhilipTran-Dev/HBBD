@@ -1,14 +1,23 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { motion, useAnimationControls } from 'framer-motion'
 import { Loader2, Mail, MailOpen } from 'lucide-react'
-import { buildFrameConstraints, getBoundingClientRectSafe, isMobileViewport } from '../lib/dom'
+import {
+  buildFrameConstraints,
+  getBoundingClientRectSafe,
+  getRefRect,
+  isMobileViewport,
+} from '../lib/dom'
 
 const MAX_ENVELOPES = 12
 
-// Full-viewport drag padding (px) kept free on every side so a letter can
-// roam the whole screen organically but can never be dragged under the home
-// indicator, the browser chrome, or into a gesture zone.
-const DRAG_PADDING = 16
+// Safe-area drag margins (px). The top band protects the status bar / camera
+// notch, the bottom band clears the action buttons, and the side bumpers keep
+// an envelope's full box on screen. Everything below derives from these, so a
+// letter can NEVER leave the visible viewport.
+const SAFE_LEFT = 16
+const SAFE_RIGHT = 16
+const SAFE_TOP = 70
+const SAFE_BOTTOM = 80
 
 const ENVELOPE_PALETTES = [
   { bg: 'from-amber-200 to-yellow-300', border: 'border-amber-400', badge: 'bg-amber-100 text-amber-800' },
@@ -28,12 +37,11 @@ function seededUnit(seed) {
 }
 
 /**
- * Deterministic full-viewport layout.
- *
- * Spawn bands avoid the unsafe zones on a phone: nothing starts inside the
- * notch/status-bar strip (< ~14% height) and nothing below the action buttons
- * (> ~75% height). A lone letter gets a centered, comfortable seat near the
- * upper-middle instead of being parked in a corner under the camera.
+ * Deterministic full-viewport layout, clamped to zones that are guaranteed
+ * clear on mobile:
+ *   - top 16%..65%: stays below the status bar / notch AND above the bottom
+ *     navigation / action buttons.
+ *   - left 8%..72%: stays inside the screen edges and clear of edge gestures.
  */
 function buildLayout(wishes) {
   const clamped = wishes.slice(0, MAX_ENVELOPES)
@@ -54,12 +62,10 @@ function buildLayout(wishes) {
 
   return clamped.map((wish) => {
     const key = String(wish.id)
-    // top: 14% -> 72%, always clear of the notch strip and bottom controls.
-    // left: 6% -> 78%, avoids the screen edges and inside-buttons.
     return {
       wish,
-      left: `${6 + seededUnit(`${key}-x`) * 72}%`,
-      top: `${14 + seededUnit(`${key}-y`) * 58}%`,
+      left: `${8 + seededUnit(`${key}-x`) * 64}%`,
+      top: `${16 + seededUnit(`${key}-y`) * 49}%`,
       duration: 6 + seededUnit(`${key}-d`) * 4,
       delay: seededUnit(`${key}-t`) * 1.2,
       tilt: -8 + seededUnit(`${key}-r`) * 16,
@@ -83,7 +89,7 @@ function FloatingStatus({ children, mobile }) {
 }
 
 function FloatingEnvelope({
-  mobile,
+  boardRef,
   wish,
   left,
   top,
@@ -98,37 +104,38 @@ function FloatingEnvelope({
   // release, absorbing the synthetic click browsers emit on touch-up.
   const isDraggingRef = useRef(false)
 
-  // Boundary snapback: if a fling ends up out of the visible safe area, ease
-  // the envelope smoothly back to its slot instead of losing it forever.
+  // Boundary snapback: a defensive second layer — even though the constraint
+  // deltas alone guarantee the envelope stays in the safe area, this eases it
+  // home if a mid-drag viewport change ever leaves it slightly out of bounds.
   const snapControls = useAnimationControls()
 
-  // Numeric drag constraints bound to the full viewport with a DRAG_PADDING
-  // bumper on every side. Computed as pure math (no live ref measurement —
-  // framer-motion throws `e.getBoundingClientRect is not a function` when a
-  // constraint ref detaches), so signing a drag can never crash.
-  //
-  // The envelope is square in both breakpoints (w-20/h-20 = 80px,
-  // sm:w-24/sm:h-24 = 96px), so width and height always match.
+  // Numeric drag constraints are DELTAS from the envelope's initial CSS
+  // position (x=y=0 at rest), never absolute viewport coords. We compute the
+  // safe region from the full-screen board rect (with SAFE_* margins) and
+  // convert it into exact min/max deltas via buildFrameConstraints, so the
+  // envelope's box physically cannot cross the padded screen edge. Pure math,
+  // no ref handed to framer — it cannot crash on a detached ref either.
   const [constraints, setConstraints] = useState(null)
   useLayoutEffect(() => {
     const isSm = typeof window !== 'undefined' && window.matchMedia('(min-width: 640px)').matches
     const size = isSm ? 96 : 80
 
     const compute = () => {
-      if (typeof window === 'undefined') return null
-      const width = window.innerWidth
-      const height = window.innerHeight
-      // Shrink the frame by DRAG_PADDING on each side; buildFrameConstraints
-      // then keeps the envelope's full box inside that region.
-      const paddedFrame = {
-        left: DRAG_PADDING,
-        top: DRAG_PADDING,
-        width: width - DRAG_PADDING * 2,
-        height: height - DRAG_PADDING * 2,
-        right: width - DRAG_PADDING,
-        bottom: height - DRAG_PADDING,
+      const rect = getRefRect(boardRef)
+      const width = rect?.width ?? (typeof window !== 'undefined' ? window.innerWidth : 0)
+      const height = rect?.height ?? (typeof window !== 'undefined' ? window.innerHeight : 0)
+      const originX = rect?.left ?? 0
+      const originY = rect?.top ?? 0
+
+      const safeFrame = {
+        left: originX + SAFE_LEFT,
+        top: originY + SAFE_TOP,
+        width,
+        height,
+        right: originX + width - SAFE_RIGHT,
+        bottom: originY + height - SAFE_BOTTOM,
       }
-      return buildFrameConstraints(paddedFrame, { left, top, width: size, height: size })
+      return buildFrameConstraints(safeFrame, { left, top, width: size, height: size })
     }
 
     let alive = true
@@ -136,8 +143,7 @@ function FloatingEnvelope({
       if (alive) setConstraints(compute())
     })
 
-    // Recompute when the viewport changes so a rotation / resize can never
-    // leave stale boundaries that send envelopes off-screen.
+    // Recompute on rotation / resize so constraints never go stale.
     const onResize = () => {
       setConstraints(compute())
     }
@@ -148,7 +154,7 @@ function FloatingEnvelope({
       cancelAnimationFrame(frameId)
       window.removeEventListener('resize', onResize)
     }
-  }, [left, top])
+  }, [boardRef, left, top])
 
   const handleClick = (event) => {
     // A drag / hold-and-move must never open the letter modal. Only a clean,
@@ -167,18 +173,19 @@ function FloatingEnvelope({
       isDraggingRef.current = false
     }, 100)
 
-    // Boundary recovery: if the envelope was flung past the padded viewport
-    // region (a hard fling can overshoot the elastic on desktop momentum),
-    // tween it smoothly back to its slot (x/y -> 0 returns to the CSS
-    // left/top position).
+    // Defensive snapback against the same SAFE_* bounds used by the
+    // constraints. With dragMomentum=false this fires only in exotic cases
+    // (e.g. viewport resize mid-drag) — and the envelope is ALWAYS brought
+    // back into view instead of being lost off-screen.
     const rect = getBoundingClientRectSafe(event?.currentTarget)
     if (!rect) return
-    if (typeof window === 'undefined') return
-    const safeRight = window.innerWidth - DRAG_PADDING
-    const safeBottom = window.innerHeight - DRAG_PADDING
+    const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : rect.right
+    const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : rect.bottom
+    const safeRight = viewportWidth - SAFE_RIGHT
+    const safeBottom = viewportHeight - SAFE_BOTTOM
     const outOfBounds =
-      rect.left < DRAG_PADDING ||
-      rect.top < DRAG_PADDING ||
+      rect.left < SAFE_LEFT ||
+      rect.top < SAFE_TOP ||
       rect.right > safeRight ||
       rect.bottom > safeBottom
     if (outOfBounds) {
@@ -195,9 +202,10 @@ function FloatingEnvelope({
       type="button"
       drag
       dragConstraints={constraints ?? undefined}
-      dragElastic={0.2}
-      dragMomentum={!mobile}
-      dragTransition={{ power: 0.4, bounceStiffness: 260, bounceDamping: 20 }}
+      dragElastic={0.08}
+      dragMomentum={false}
+      dragSnapToOrigin={false}
+      dragTransition={{ bounceStiffness: 260, bounceDamping: 20 }}
       onDragStart={() => {
         isDraggingRef.current = true
       }}
@@ -210,7 +218,13 @@ function FloatingEnvelope({
       whileDrag={{ scale: 1.15, zIndex: 40, cursor: 'grabbing' }}
       aria-label={`Mở thư của ${wish.sender_name}`}
       className="pointer-events-auto absolute z-30 flex h-20 w-20 cursor-grab touch-none select-none flex-col items-center justify-center focus:outline-none focus-visible:ring-4 focus-visible:ring-amber-300 active:cursor-grabbing sm:h-24 sm:w-24"
-      style={{ left, top, willChange: 'transform', transform: 'translate3d(0, 0, 0)' }}
+      style={{
+        left,
+        top,
+        touchAction: 'none',
+        willChange: 'transform',
+        transform: 'translate3d(0, 0, 0)',
+      }}
     >
       <motion.div
         animate={
@@ -248,11 +262,12 @@ export default function WishesBoard({
   onOpenWish,
   pausedId,
 }) {
+  const boardRef = useRef(null)
   const mobile = useMemo(() => isMobileViewport(), [])
   const items = useMemo(() => buildLayout(wishes), [wishes])
 
   return (
-    <div className="pointer-events-none fixed inset-0 z-30 overflow-hidden">
+    <div ref={boardRef} className="pointer-events-none fixed inset-0 z-30 overflow-hidden">
       {loading && (
         <FloatingStatus mobile={mobile}>
           <Loader2 className="h-4 w-4 animate-spin text-amber-500" />
@@ -285,7 +300,7 @@ export default function WishesBoard({
         items.map(({ wish, left, top, duration, delay, tilt, palette }) => (
           <FloatingEnvelope
             key={wish.id}
-            mobile={mobile}
+            boardRef={boardRef}
             wish={wish}
             left={left}
             top={top}
