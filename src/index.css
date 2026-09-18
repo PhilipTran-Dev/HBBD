@@ -6,6 +6,7 @@
   --font-display: 'Baloo 2', 'Segoe UI', system-ui, sans-serif;
 }
 
+
 #root {
   min-height: 100dvh;
 }
@@ -20,10 +21,12 @@ body {
 }
 
 @keyframes float-slow {
+
   0%,
   100% {
     transform: translateY(0) translateX(0);
   }
+
   50% {
     transform: translateY(-14px) translateX(6px);
   }
