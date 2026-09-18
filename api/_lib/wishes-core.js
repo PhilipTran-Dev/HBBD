@@ -6,20 +6,28 @@
  *
  * 1. NO external client is created at module top level. `connect()` and the
  *    Groq client are loaded lazily inside guarded getters (`getConnect`,
- *    `getGroq`), and only when a request actually needs them. If environment
- *    variables are missing or the vendor modules fail to resolve, the function
- *    container still boots a valid handler instead of crashing on import.
- * 2. Every config failure throws a typed `ConfigError` carrying a stable
- *    `statusCode`, so handlers can answer 503 "I'm up, backend isn't
+ *    `getGroqModule`), and only when a request actually needs them. If
+ *    environment variables are missing or the vendor modules fail to resolve,
+ *    the function container still boots a valid handler instead of crashing on
+ *    import.
+ * 2. Database configuration failures throw a typed `ConfigError` carrying a
+ *    stable `statusCode`, so handlers can answer 503 "I'm up, backend isn't
  *    configured" instead of a misleading 500.
- * 3. `check-status.js` deliberately does NOT import this module: a health
+ * 3. Groq AI configuration is DECOUPLED from bootstrapping entirely:
+ *    `resolveGroqConfig` never throws and never requires an API key, so
+ *    read-only operations (`getWishes`, `getStatus`) can never fail because
+ *    the AI key is unconfigured. Moderation is a best-effort layer: if the key
+ *    is missing, or Groq errors (rate limit, quota, invalid credentials,
+ *    network timeout), the wish simply bypasses moderation and saves directly.
+ * 4. `check-status.js` deliberately does NOT import this module: a health
  *    check must stay zero-dependency so it can never be brought down by a
  *    database/driver failure.
  *
  * Database credentials are resolved the same way on Vercel and locally:
  *   - `DATABASE_URL` if set (a full `mysql://` connection string), otherwise
  *   - composed from `TIDB_HOST`, `TIDB_USER`, `TIDB_PASSWORD`, and
- *     `TIDB_DATABASE` (defaulting to `test`).
+ *     `TIDB_DATABASE` (defaulting to `test` — the schema-creation fallback
+ *     that avoids MySQL Error 1142 "CREATE command denied on sys").
  */
 
 export class ConfigError extends Error {
@@ -33,6 +41,9 @@ export class ConfigError extends Error {
 const COOLDOWN_SECONDS = 30 * 60
 const LOCKOUT_SECONDS = 30 * 60
 const MAX_STRIKES = 3
+// The schema must never be created against the TiDB `sys` metadata database
+// (CREATE is denied there -> Error 1142), so any missing TIDB_DATABASE value
+// always falls back to `test`.
 const DEFAULT_DATABASE = 'test'
 
 const MODERATION_SYSTEM_PROMPT = `You are an uncompromising content safety auditor for a family birthday website.
@@ -141,10 +152,19 @@ export function resolveDbConfig(env) {
   }
 }
 
+/**
+ * Resolve the Groq configuration WITHOUT touching the boot path.
+ *
+ * Groq is deliberately optional: the API key defaults to an empty string and
+ * is never validated here, so `getWishes` / `getStatus` keep working even when
+ * the AI key is missing, unset, or still being initialized. Moderation becomes
+ * a best-effort layer (see `moderateWish`) that degrades to "allow" rather
+ * than failing read operations or the wish-write path.
+ */
 export function resolveGroqConfig(env) {
   return {
-    apiKey: requireEnv(env.GROQ_API_KEY, 'GROQ_API_KEY'),
-    model: env.GROQ_MODEL ?? 'openai/gpt-oss-20b',
+    apiKey: env.GROQ_API_KEY || '',
+    model: env.GROQ_MODEL ?? 'llama-3.3-70b-versatile',
   }
 }
 
@@ -237,6 +257,11 @@ async function readLimits(db, ip) {
   return rows?.[0] ?? null
 }
 
+/**
+ * Raw Groq moderation call. THROWS on any runtime failure (rate limit, quota
+ * exceeded, invalid credentials, network timeout) or an unreadable verdict.
+ * `moderateWish` is the only caller and owns the error handling.
+ */
 async function moderateContent({ senderName, message }, groqConfig) {
   const { default: Groq } = await getGroqModule()
   const client = new Groq({ apiKey: groqConfig.apiKey })
@@ -265,9 +290,36 @@ async function moderateContent({ senderName, message }, groqConfig) {
 }
 
 /**
+ * Resilient moderation wrapper — the ONLY entry point used by `createWish`.
+ *
+ * Guarantees a well-formed `{ isAppropriate, reason, bypassed }` result on
+ * EVERY exit so the wish-write path can never crash on AI trouble:
+ *   - No API key configured  -> bypass: allow the wish without moderation.
+ *   - Groq runtime error     -> log `console.warn('Groq AI bypass ...')` then
+ *                               allow the wish to proceed to the database.
+ *   - Clean verdict          -> surfaced unchanged; the caller keeps the
+ *                               existing strike / penalty logic for content
+ *                               the model marks inappropriate.
+ */
+async function moderateWish({ senderName, message }, groqConfig) {
+  if (!groqConfig.apiKey) {
+    console.warn('Groq AI bypass due to missing GROQ_API_KEY:', 'moderation skipped for a new wish')
+    return { isAppropriate: true, reason: '', bypassed: true }
+  }
+
+  try {
+    const verdict = await moderateContent({ senderName, message }, groqConfig)
+    return { isAppropriate: verdict.isAppropriate, reason: verdict.reason, bypassed: false }
+  } catch (error) {
+    console.warn('Groq AI bypass due to error:', error.message)
+    return { isAppropriate: true, reason: '', bypassed: true }
+  }
+}
+
+/**
  * A single, framework-agnostic wishes API used by the Vite dev/preview
  * middleware (vite.config.js) AND the Vercel serverless functions
- * (api/check-status.js, api/wishes.js).
+ * (api/wishes.js).
  *
  * Reads its configuration from the passed `env` object, defaulting to
  * `process.env` (the Vercel runtime's environment variables). No external
@@ -338,7 +390,10 @@ export function createWishesApi({ env = process.env } = {}) {
       }
     }
 
-    const verdict = await moderateContent({ senderName, message }, groqConfig)
+    // Best-effort moderation. On a clean rejection the strike/penalty hooks
+    // below run exactly as before; on absence or failure of the AI layer the
+    // wish is allowed through so the feature never goes down with Groq.
+    const verdict = await moderateWish({ senderName, message }, groqConfig)
 
     if (!verdict.isAppropriate) {
       const newStrikes = status.strikes + 1
